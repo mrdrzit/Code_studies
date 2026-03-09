@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -16,6 +16,8 @@ class LoadResult:
     width: int
     height: int
     fps: float
+    preview_width: int
+    preview_height: int
     first_frame_rgb: np.ndarray
 
 
@@ -33,18 +35,36 @@ class LoaderWorker(QObject):
     def _emit_progress(self, percent: int, stage_text: str) -> None:
         self.progress_changed.emit(percent, "Loading video...", stage_text)
 
-    def _resize_for_preview(self, frame_rgb: np.ndarray) -> np.ndarray:
+    def _compute_preview_size(self, width: int, height: int) -> Tuple[int, int]:
         if self.preview_width is None or self.preview_width <= 0:
-            return frame_rgb
+            return width, height
 
+        if width <= self.preview_width:
+            return width, height
+
+        scale = self.preview_width / float(width)
+        preview_width = int(round(width * scale))
+        preview_height = int(round(height * scale))
+
+        preview_width = max(1, preview_width)
+        preview_height = max(1, preview_height)
+        return preview_width, preview_height
+
+    def _resize_to_preview(
+        self,
+        frame_rgb: np.ndarray,
+        preview_width: int,
+        preview_height: int,
+    ) -> np.ndarray:
         h, w = frame_rgb.shape[:2]
-        if w <= self.preview_width:
+        if w == preview_width and h == preview_height:
             return frame_rgb
 
-        scale = self.preview_width / float(w)
-        new_w = int(round(w * scale))
-        new_h = int(round(h * scale))
-        return cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        return cv2.resize(
+            frame_rgb,
+            (preview_width, preview_height),
+            interpolation=cv2.INTER_AREA,
+        )
 
     @Slot()
     def run(self) -> None:
@@ -64,9 +84,10 @@ class LoaderWorker(QObject):
             self._emit_progress(50, "Preparing preview")
             first = vr[0].asnumpy()  # RGB
             height, width = first.shape[:2]
+            preview_width, preview_height = self._compute_preview_size(width, height)
 
             self._emit_progress(75, "Decoding first frame")
-            first_frame_rgb = self._resize_for_preview(first)
+            first_frame_rgb = self._resize_to_preview(first, preview_width, preview_height)
 
             self._emit_progress(100, "Finalizing")
             result = LoadResult(
@@ -75,6 +96,8 @@ class LoaderWorker(QObject):
                 width=width,
                 height=height,
                 fps=fps,
+                preview_width=preview_width,
+                preview_height=preview_height,
                 first_frame_rgb=first_frame_rgb,
             )
             self.load_finished.emit(result)

@@ -22,6 +22,8 @@ from src.core.frame_cache import FrameCache
 from src.core.video_session import VideoSession
 from src.core.decode_worker import DecodeWorker
 from src.core.loader_worker import LoaderWorker, LoadResult
+from src.core.export_worker import ExportWorker
+from src.core.export_session import ExportSession
 
 
 class VideoViewer(QWidget):
@@ -31,6 +33,7 @@ class VideoViewer(QWidget):
         self.setWindowTitle("Fast Decord Frame Viewer")
         self.resize(1100, 800)
 
+        self.export_session: Optional[ExportSession] = None
         self.session: Optional[VideoSession] = None
         self.cache: Optional[FrameCache] = None
         self.worker: Optional[DecodeWorker] = None
@@ -38,6 +41,9 @@ class VideoViewer(QWidget):
         self.loader_thread: Optional[QThread] = None
         self.loader_worker: Optional[LoaderWorker] = None
         self.is_loading = False
+
+        self.export_thread = None
+        self.export_worker = None
 
         self.current_index = 0
         self.last_requested_index = 0
@@ -67,6 +73,7 @@ class VideoViewer(QWidget):
         self.open_button = QPushButton("Open")
         self.prev_button = QPushButton("<<")
         self.next_button = QPushButton(">>")
+        self.export_button = QPushButton("Export Frame")
 
         self.frame_edit = QLineEdit()
         self.frame_edit.setPlaceholderText("Frame #")
@@ -82,6 +89,7 @@ class VideoViewer(QWidget):
         top_row.addWidget(self.prev_button)
         top_row.addWidget(self.next_button)
         top_row.addWidget(self.frame_edit)
+        top_row.addWidget(self.export_button)
         top_row.addStretch(1)
 
         layout = QVBoxLayout(self)
@@ -98,6 +106,7 @@ class VideoViewer(QWidget):
         self.prev_button.clicked.connect(lambda: self.step(-1))
         self.next_button.clicked.connect(lambda: self.step(+1))
         self.frame_edit.returnPressed.connect(self.jump_to_frame)
+        self.export_button.clicked.connect(self.export_current_frame)
 
         self.slider.sliderPressed.connect(self._on_slider_pressed)
         self.slider.sliderMoved.connect(self._on_slider_moved)
@@ -119,6 +128,7 @@ class VideoViewer(QWidget):
     def closeEvent(self, event) -> None:
         self._cleanup_loader()
         self._cleanup_decode_worker()
+        self._cleanup_export_session()
         super().closeEvent(event)
 
     def open_dialog(self) -> None:
@@ -144,6 +154,7 @@ class VideoViewer(QWidget):
         self.next_button.setEnabled(enabled)
         self.slider.setEnabled(enabled)
         self.frame_edit.setEnabled(enabled)
+        self.export_button.setEnabled(enabled)
 
     def _cleanup_decode_worker(self) -> None:
         if self.worker is not None:
@@ -154,7 +165,6 @@ class VideoViewer(QWidget):
         thread = self.loader_thread
         worker = self.loader_worker
 
-        # Clear refs first so future calls are harmless
         self.loader_thread = None
         self.loader_worker = None
 
@@ -170,7 +180,6 @@ class VideoViewer(QWidget):
                     thread.quit()
                     thread.wait()
             except RuntimeError:
-                # Underlying Qt object was already deleted
                 pass
 
     def _on_loader_thread_finished(self) -> None:
@@ -208,6 +217,7 @@ class VideoViewer(QWidget):
     def start_video_load(self, path: str) -> None:
         self._cleanup_loader()
         self._cleanup_decode_worker()
+        self._cleanup_export_session()
 
         self.session = None
         self.cache = None
@@ -234,13 +244,26 @@ class VideoViewer(QWidget):
     def handle_load_finished(self, result: LoadResult) -> None:
         try:
             self._cleanup_decode_worker()
+            self._cleanup_export_session()
 
-            # Works with your current unchanged VideoSession.
-            # Note: this still reopens the reader synchronously once.
-            self.session = VideoSession(path=result.path, preview_width=960)
+            self.session = VideoSession(
+                path=result.path,
+                preview_width=result.preview_width,
+                preview_height=result.preview_height,
+                frame_count=result.frame_count,
+                width=result.width,
+                height=result.height,
+                fps=result.fps,
+            )
             self.cache = FrameCache(capacity=200)
-            self.worker = DecodeWorker(self.session, self.cache)
+            self.cache.put(0, result.first_frame_rgb)
 
+            self.export_session = ExportSession(
+                video_path=result.path,
+                frame_count=result.frame_count,
+            )
+
+            self.worker = DecodeWorker(self.session, self.cache)
             self.worker.frame_ready.connect(self._on_frame_ready)
             self.worker.error.connect(self._on_worker_error)
             self.worker.start()
@@ -253,7 +276,8 @@ class VideoViewer(QWidget):
                 f"{os.path.basename(result.path)} | "
                 f"{result.width}x{result.height} | "
                 f"{result.frame_count} frames | "
-                f"{result.fps:.3f} fps"
+                f"{result.fps:.3f} fps | "
+                f"preview {result.preview_width}x{result.preview_height}"
             )
 
             self._display_frame_rgb(result.first_frame_rgb)
@@ -269,6 +293,7 @@ class VideoViewer(QWidget):
         self.session = None
         self.cache = None
         self._cleanup_decode_worker()
+        self._cleanup_export_session()
         self._set_navigation_enabled(False)
         self.status_label.setText(message)
         self.info_label.setText("No video loaded")
@@ -402,6 +427,15 @@ class VideoViewer(QWidget):
             f"Frame {index} | {source} | {latency_ms:.1f} ms | cache size: {cache_size}"
         )
 
+    def _cleanup_export_session(self) -> None:
+        self.export_session = None
+
+    def _on_export_finished(self, path: str) -> None:
+        self.status_label.setText(f"Exported: {path}")
+
+    def _on_export_failed(self, message: str) -> None:
+        self.status_label.setText(f"Export failed: {message}")
+
     def _on_worker_error(self, message: str) -> None:
         self.status_label.setText(f"Worker error: {message}")
 
@@ -415,3 +449,37 @@ class VideoViewer(QWidget):
                 Qt.SmoothTransformation,
             )
             self.image_label.setPixmap(scaled)
+
+    def export_current_frame(self) -> None:
+
+        if self.session is None:
+            return
+
+        output_root = QFileDialog.getExistingDirectory(
+            self,
+            "Select export folder",
+        )
+
+        if not output_root:
+            return
+
+        frame_index = self.current_index
+        frame_count = self.session.frame_count
+        video_path = self.session.path
+
+        self.export_thread = QThread(self)
+        self.export_worker = ExportWorker(
+            video_path,
+            frame_index,
+            frame_count,
+            output_root,
+        )
+
+        self.export_worker.moveToThread(self.export_thread)
+        self.export_thread.started.connect(self.export_worker.run)
+        self.export_worker.export_finished.connect(self._on_export_finished)
+        self.export_worker.export_failed.connect(self._on_export_failed)
+        self.export_worker.finished.connect(self.export_thread.quit)
+        self.export_worker.finished.connect(self.export_worker.deleteLater)
+        self.export_thread.finished.connect(self.export_thread.deleteLater)
+        self.export_thread.start()

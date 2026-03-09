@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
-import cv2
 import numpy as np
 from decord import VideoReader, cpu
 
@@ -21,13 +20,22 @@ class VideoSession:
     """
     Synchronous Decord wrapper.
     Threading/caching stay outside this class.
+
+    Source/original metadata are stored in:
+    - self.width
+    - self.height
+
+    Interactive browsing uses a preview-sized reader:
+    - self.preview_width
+    - self.preview_height
     """
 
     def __init__(
         self,
         path: str,
-        preview_width: Optional[int] = 640,
         *,
+        preview_width: Optional[int] = None,
+        preview_height: Optional[int] = None,
         frame_count: Optional[int] = None,
         width: Optional[int] = None,
         height: Optional[int] = None,
@@ -35,15 +43,22 @@ class VideoSession:
     ) -> None:
         self.path = path
         self.preview_width = preview_width
+        self.preview_height = preview_height
 
-        # Open persistent reader
-        self.vr = VideoReader(path, ctx=cpu(0))
+        reader_kwargs = {"ctx": cpu(0)}
+        if preview_width is not None and preview_height is not None:
+            reader_kwargs["width"] = int(preview_width)
+            reader_kwargs["height"] = int(preview_height)
 
-        # Use metadata from loader if available
+        self.vr = VideoReader(path, **reader_kwargs)
+
         if frame_count is None:
             frame_count = len(self.vr)
 
         if width is None or height is None:
+            # Fall back to reading source dims only if metadata was not provided.
+            # Note: if the reader is preview-sized, this fallback reflects preview
+            # dimensions, so the loader should normally provide source dims.
             first = self.vr[0].asnumpy()
             height, width = first.shape[:2]
 
@@ -53,10 +68,10 @@ class VideoSession:
             except Exception:
                 fps = 0.0
 
-        self.frame_count = frame_count
-        self.width = width
-        self.height = height
-        self.fps = fps
+        self.frame_count = int(frame_count)
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = float(fps)
 
     def get_metadata(self) -> VideoMetadata:
         return VideoMetadata(
@@ -67,23 +82,9 @@ class VideoSession:
             fps=self.fps,
         )
 
-    def _resize_for_preview(self, frame_rgb: np.ndarray) -> np.ndarray:
-        if self.preview_width is None or self.preview_width <= 0:
-            return frame_rgb
-
-        h, w = frame_rgb.shape[:2]
-        if w <= self.preview_width:
-            return frame_rgb
-
-        scale = self.preview_width / float(w)
-        new_w = int(round(w * scale))
-        new_h = int(round(h * scale))
-        return cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
     def get_frame(self, index: int) -> np.ndarray:
         index = max(0, min(index, self.frame_count - 1))
-        frame = self.vr[index].asnumpy()  # RGB
-        return self._resize_for_preview(frame)
+        return self.vr[index].asnumpy()  # already preview-sized RGB
 
     def get_batch(self, indices: Iterable[int]) -> List[np.ndarray]:
         cleaned = []
@@ -94,5 +95,5 @@ class VideoSession:
         if not cleaned:
             return []
 
-        batch = self.vr.get_batch(cleaned).asnumpy()  # RGB
-        return [self._resize_for_preview(frame) for frame in batch]
+        batch = self.vr.get_batch(cleaned).asnumpy()  # already preview-sized RGB
+        return [frame for frame in batch]
