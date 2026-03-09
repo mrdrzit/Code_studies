@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 from decord import VideoReader, cpu
 
+
 @dataclass
 class VideoMetadata:
     path: str
@@ -22,20 +23,40 @@ class VideoSession:
     Threading/caching stay outside this class.
     """
 
-    def __init__(self, path: str, preview_width: Optional[int] = 640) -> None:
+    def __init__(
+        self,
+        path: str,
+        preview_width: Optional[int] = 640,
+        *,
+        frame_count: Optional[int] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        fps: Optional[float] = None,
+    ) -> None:
         self.path = path
         self.preview_width = preview_width
 
+        # Open persistent reader
         self.vr = VideoReader(path, ctx=cpu(0))
-        self.frame_count = len(self.vr)
 
-        first = self.vr[0].asnumpy()
-        self.height, self.width = first.shape[:2]
+        # Use metadata from loader if available
+        if frame_count is None:
+            frame_count = len(self.vr)
 
-        try:
-            self.fps = float(self.vr.get_avg_fps())
-        except Exception:
-            self.fps = 0.0
+        if width is None or height is None:
+            first = self.vr[0].asnumpy()
+            height, width = first.shape[:2]
+
+        if fps is None:
+            try:
+                fps = float(self.vr.get_avg_fps())
+            except Exception:
+                fps = 0.0
+
+        self.frame_count = frame_count
+        self.width = width
+        self.height = height
+        self.fps = fps
 
     def get_metadata(self) -> VideoMetadata:
         return VideoMetadata(

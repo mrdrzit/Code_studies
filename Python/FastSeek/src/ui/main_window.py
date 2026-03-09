@@ -4,7 +4,7 @@ import os
 from typing import List, Optional
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QThread
 from PySide6.QtGui import QImage, QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QWidget,
@@ -15,11 +15,14 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QFileDialog,
     QLineEdit,
+    QProgressBar,
 )
 
 from src.core.frame_cache import FrameCache
 from src.core.video_session import VideoSession
 from src.core.decode_worker import DecodeWorker
+from src.core.loader_worker import LoaderWorker, LoadResult
+
 
 class VideoViewer(QWidget):
     def __init__(self, video_path: Optional[str] = None) -> None:
@@ -31,6 +34,10 @@ class VideoViewer(QWidget):
         self.session: Optional[VideoSession] = None
         self.cache: Optional[FrameCache] = None
         self.worker: Optional[DecodeWorker] = None
+
+        self.loader_thread: Optional[QThread] = None
+        self.loader_worker: Optional[LoaderWorker] = None
+        self.is_loading = False
 
         self.current_index = 0
         self.last_requested_index = 0
@@ -44,6 +51,15 @@ class VideoViewer(QWidget):
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(640, 360)
         self.image_label.setStyleSheet("background: #111; color: #ddd;")
+
+        self.loading_main_label = QLabel("Loading video...")
+        self.loading_main_label.setAlignment(Qt.AlignCenter)
+        self.loading_stage_label = QLabel("Starting")
+        self.loading_stage_label.setAlignment(Qt.AlignCenter)
+
+        self.loading_progress_bar = QProgressBar()
+        self.loading_progress_bar.setRange(0, 100)
+        self.loading_progress_bar.setValue(0)
 
         self.info_label = QLabel("No video loaded")
         self.status_label = QLabel("Idle")
@@ -71,6 +87,9 @@ class VideoViewer(QWidget):
         layout = QVBoxLayout(self)
         layout.addLayout(top_row)
         layout.addWidget(self.image_label, stretch=1)
+        layout.addWidget(self.loading_main_label)
+        layout.addWidget(self.loading_stage_label)
+        layout.addWidget(self.loading_progress_bar)
         layout.addWidget(self.slider)
         layout.addWidget(self.info_label)
         layout.addWidget(self.status_label)
@@ -91,15 +110,21 @@ class VideoViewer(QWidget):
         QShortcut(QKeySequence("Ctrl+Left"), self, activated=lambda: self.step(-100))
         QShortcut(QKeySequence("Ctrl+Right"), self, activated=lambda: self.step(+100))
 
+        self._set_loading_widgets_visible(False)
+        self._set_navigation_enabled(False)
+
         if video_path:
-            self.load_video(video_path)
+            self.start_video_load(video_path)
 
     def closeEvent(self, event) -> None:
-        if self.worker is not None:
-            self.worker.stop()
+        self._cleanup_loader()
+        self._cleanup_decode_worker()
         super().closeEvent(event)
 
     def open_dialog(self) -> None:
+        if self.is_loading:
+            return
+
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Open video",
@@ -107,35 +132,149 @@ class VideoViewer(QWidget):
             "Videos (*.mp4 *.avi *.mov *.mkv *.wmv *.webm);;All files (*)",
         )
         if path:
-            self.load_video(path)
+            self.start_video_load(path)
 
-    def load_video(self, path: str) -> None:
+    def _set_loading_widgets_visible(self, visible: bool) -> None:
+        self.loading_main_label.setVisible(visible)
+        self.loading_stage_label.setVisible(visible)
+        self.loading_progress_bar.setVisible(visible)
+
+    def _set_navigation_enabled(self, enabled: bool) -> None:
+        self.prev_button.setEnabled(enabled)
+        self.next_button.setEnabled(enabled)
+        self.slider.setEnabled(enabled)
+        self.frame_edit.setEnabled(enabled)
+
+    def _cleanup_decode_worker(self) -> None:
         if self.worker is not None:
             self.worker.stop()
             self.worker = None
 
-        self.session = VideoSession(path=path, preview_width=960)
-        self.cache = FrameCache(capacity=200)
-        self.worker = DecodeWorker(self.session, self.cache)
+    def _cleanup_loader(self) -> None:
+        thread = self.loader_thread
+        worker = self.loader_worker
 
-        self.worker.frame_ready.connect(self._on_frame_ready)
-        self.worker.error.connect(self._on_worker_error)
-        self.worker.start()
+        # Clear refs first so future calls are harmless
+        self.loader_thread = None
+        self.loader_worker = None
 
-        meta = self.session.get_metadata()
-        self.slider.setMaximum(meta.frame_count - 1)
+        if worker is not None:
+            try:
+                worker.deleteLater()
+            except RuntimeError:
+                pass
+
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait()
+            except RuntimeError:
+                # Underlying Qt object was already deleted
+                pass
+
+    def _on_loader_thread_finished(self) -> None:
+        self.loader_thread = None
+        self.loader_worker = None
+
+    def enter_loading_state(self) -> None:
+        self.is_loading = True
+        self.drag_timer.stop()
+        self.drag_pending_index = None
+
+        self._set_navigation_enabled(False)
+        self.open_button.setEnabled(False)
+
+        self.loading_main_label.setText("Loading video...")
+        self.loading_stage_label.setText("Starting")
+        self.loading_progress_bar.setValue(0)
+        self._set_loading_widgets_visible(True)
+
+        self.status_label.setText("Loading...")
+        self.image_label.setText("Loading video...")
+        self.image_label.setPixmap(QPixmap())
+
+    def exit_loading_state(self) -> None:
+        self.is_loading = False
+        self._set_loading_widgets_visible(False)
+        self.open_button.setEnabled(True)
+
+    def update_loading_progress(self, percent: int, main_text: str, stage_text: str) -> None:
+        self.loading_progress_bar.setValue(percent)
+        self.loading_main_label.setText(main_text)
+        self.loading_stage_label.setText(stage_text)
+        self.status_label.setText(stage_text)
+
+    def start_video_load(self, path: str) -> None:
+        self._cleanup_loader()
+        self._cleanup_decode_worker()
+
+        self.session = None
+        self.cache = None
         self.current_index = 0
         self.last_requested_index = 0
 
-        self.info_label.setText(
-            f"{os.path.basename(meta.path)} | "
-            f"{meta.width}x{meta.height} | "
-            f"{meta.frame_count} frames | "
-            f"{meta.fps:.3f} fps"
-        )
-        self.status_label.setText("Loaded. Requesting first frame...")
+        self.enter_loading_state()
 
-        self.request_frame(0, settled=True)
+        self.loader_thread = QThread(self)
+        self.loader_worker = LoaderWorker(path=path, preview_width=960)
+        self.loader_worker.moveToThread(self.loader_thread)
+
+        self.loader_thread.started.connect(self.loader_worker.run)
+        self.loader_worker.progress_changed.connect(self.update_loading_progress)
+        self.loader_worker.load_finished.connect(self.handle_load_finished)
+        self.loader_worker.load_failed.connect(self.handle_load_failed)
+        self.loader_worker.finished.connect(self.loader_thread.quit)
+        self.loader_worker.finished.connect(self.loader_worker.deleteLater)
+        self.loader_thread.finished.connect(self._on_loader_thread_finished)
+        self.loader_thread.finished.connect(self.loader_thread.deleteLater)
+
+        self.loader_thread.start()
+
+    def handle_load_finished(self, result: LoadResult) -> None:
+        try:
+            self._cleanup_decode_worker()
+
+            # Works with your current unchanged VideoSession.
+            # Note: this still reopens the reader synchronously once.
+            self.session = VideoSession(path=result.path, preview_width=960)
+            self.cache = FrameCache(capacity=200)
+            self.worker = DecodeWorker(self.session, self.cache)
+
+            self.worker.frame_ready.connect(self._on_frame_ready)
+            self.worker.error.connect(self._on_worker_error)
+            self.worker.start()
+
+            self.slider.setMaximum(max(0, result.frame_count - 1))
+            self.current_index = 0
+            self.last_requested_index = 0
+
+            self.info_label.setText(
+                f"{os.path.basename(result.path)} | "
+                f"{result.width}x{result.height} | "
+                f"{result.frame_count} frames | "
+                f"{result.fps:.3f} fps"
+            )
+
+            self._display_frame_rgb(result.first_frame_rgb)
+            self.status_label.setText("Loaded")
+            self._set_navigation_enabled(True)
+        except Exception as exc:
+            self.handle_load_failed(f"Could not finalize loaded video: {exc}")
+            return
+        finally:
+            self.exit_loading_state()
+
+    def handle_load_failed(self, message: str) -> None:
+        self.session = None
+        self.cache = None
+        self._cleanup_decode_worker()
+        self._set_navigation_enabled(False)
+        self.status_label.setText(message)
+        self.info_label.setText("No video loaded")
+        self.image_label.setText("Open a video")
+        self.image_label.setPixmap(QPixmap())
+        self.exit_loading_state()
 
     def _build_prefetch_window(self, index: int) -> List[int]:
         if self.session is None:
@@ -164,6 +303,8 @@ class VideoViewer(QWidget):
         return indices
 
     def request_frame(self, index: int, settled: bool) -> None:
+        if self.is_loading:
+            return
         if self.session is None or self.worker is None:
             return
 
@@ -179,18 +320,20 @@ class VideoViewer(QWidget):
         self.status_label.setText(f"Requesting frame {index}...")
 
     def step(self, delta: int) -> None:
-        if self.session is None:
+        if self.is_loading or self.session is None:
             return
         target = max(0, min(self.current_index + delta, self.session.frame_count - 1))
         self.slider.setValue(target)
         self.request_frame(target, settled=True)
 
     def jump_to_frame(self) -> None:
-        if self.session is None:
+        if self.is_loading or self.session is None:
             return
+
         text = self.frame_edit.text().strip()
         if not text:
             return
+
         try:
             target = int(text)
         except ValueError:
@@ -202,20 +345,28 @@ class VideoViewer(QWidget):
         self.request_frame(target, settled=True)
 
     def _on_slider_pressed(self) -> None:
+        if self.is_loading:
+            return
         self.drag_pending_index = self.slider.value()
 
     def _on_slider_moved(self, value: int) -> None:
+        if self.is_loading:
+            return
         self.drag_pending_index = value
         if not self.drag_timer.isActive():
             self.drag_timer.start()
 
     def _on_slider_released(self) -> None:
+        if self.is_loading:
+            return
         self.drag_timer.stop()
         value = self.slider.value()
         self.drag_pending_index = None
         self.request_frame(value, settled=True)
 
     def _flush_drag_request(self) -> None:
+        if self.is_loading:
+            return
         if self.drag_pending_index is None:
             return
         self.request_frame(self.drag_pending_index, settled=False)
@@ -227,13 +378,7 @@ class VideoViewer(QWidget):
         image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
         return QPixmap.fromImage(image)
 
-    def _on_frame_ready(self, index: int, frame_rgb: np.ndarray, latency_ms: float, cache_hit: bool) -> None:
-        self.current_index = index
-
-        self.slider.blockSignals(True)
-        self.slider.setValue(index)
-        self.slider.blockSignals(False)
-
+    def _display_frame_rgb(self, frame_rgb: np.ndarray) -> None:
         pixmap = self._numpy_to_pixmap(frame_rgb)
         scaled = pixmap.scaled(
             self.image_label.size(),
@@ -241,6 +386,15 @@ class VideoViewer(QWidget):
             Qt.SmoothTransformation,
         )
         self.image_label.setPixmap(scaled)
+
+    def _on_frame_ready(self, index: int, frame_rgb: np.ndarray, latency_ms: float, cache_hit: bool) -> None:
+        self.current_index = index
+
+        self.slider.blockSignals(True)
+        self.slider.setValue(index)
+        self.slider.blockSignals(False)
+
+        self._display_frame_rgb(frame_rgb)
 
         cache_size = len(self.cache) if self.cache is not None else 0
         source = "cache" if cache_hit else "decode"
@@ -253,8 +407,8 @@ class VideoViewer(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self.image_label.pixmap() is not None:
-            pixmap = self.image_label.pixmap()
+        pixmap = self.image_label.pixmap()
+        if pixmap is not None and not pixmap.isNull():
             scaled = pixmap.scaled(
                 self.image_label.size(),
                 Qt.KeepAspectRatio,
